@@ -198,7 +198,7 @@ def render_auth_page():
                 Cosmetics Recommender
             </h1>
             <p style='color:#888; font-size:0.85rem; margin:0;'>
-                MSc Thesis Prototype · Rule-Based + Content-Based + OpenAI
+                This is a prototype! App in Development!
             </p>
         </div>
     """, unsafe_allow_html=True)
