@@ -1,0 +1,6 @@
+streamlit>=1.54.0
+openai>=2.24.0
+supabase>=2.27
+python-dotenv>=1.2.1
+pandas>=2.3.3
+numpy>=2.4.1
