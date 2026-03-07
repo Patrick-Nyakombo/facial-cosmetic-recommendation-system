@@ -1,10 +1,6 @@
 """
 database.py - Supabase database layer
 MSc Thesis Prototype
-
-Uses two clients:
-  - anon client  → read-only public data (products)
-  - service role client → writes that bypass RLS (feedback, history)
 """
 
 import os
@@ -17,7 +13,6 @@ load_dotenv()
 
 
 def _get_anon_client() -> Client:
-    """Anon key client — for public read operations (products)."""
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_KEY")
     if not url or not key:
@@ -26,28 +21,17 @@ def _get_anon_client() -> Client:
 
 
 def _get_service_client() -> Client:
-    """
-    Service role key client — bypasses RLS entirely.
-    Used for inserts (feedback, history) from the backend.
-    NEVER expose this key in the frontend / browser.
-    """
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_KEY")
     if not url or not key:
-        raise EnvironmentError(
-            "Missing SUPABASE_SERVICE_KEY in .env — "
-            "add it from Supabase → Project Settings → API → service_role key"
-        )
+        raise EnvironmentError("Missing SUPABASE_SERVICE_KEY in .env")
     return create_client(url, key)
 
 
-# ─────────────────────────────────────────────
-# Fetch products (anon, cached)
-# ─────────────────────────────────────────────
+# ── Products ─────────────────────────────────────────────────────
 
 @st.cache_data(ttl=300)
 def fetch_products() -> list[dict]:
-    """Retrieve all products. Cached 5 minutes."""
     try:
         client = _get_anon_client()
         response = client.table("products").select("*").execute()
@@ -57,33 +41,82 @@ def fetch_products() -> list[dict]:
         return []
 
 
-# ─────────────────────────────────────────────
-# Insert feedback (service role — bypasses RLS)
-# ─────────────────────────────────────────────
+# ── Feedback ─────────────────────────────────────────────────────
 
-def insert_feedback(product_id: str, rating: int) -> bool:
-    """Insert a user feedback record into the feedback table."""
+def insert_feedback(
+    product_id: str,
+    rating: int,
+    is_recommended: bool | None = None,
+    review_text: str = "",
+    helpfulness: float = 0.0,
+) -> bool:
+    """Insert a rich feedback record from the user."""
     try:
         client = _get_service_client()
-        client.table("feedback").insert({
-            "product_id": product_id,
-            "rating":     rating,
-        }).execute()
+        record: dict = {"product_id": product_id, "rating": rating, "helpfulness": helpfulness}
+        if is_recommended is not None:
+            record["is_recommended"] = is_recommended
+        if review_text.strip():
+            record["review_text"] = review_text.strip()
+        client.table("feedback").insert(record).execute()
         return True
     except Exception as exc:
         st.error(f"Database error while saving feedback: {exc}")
         return False
 
 
-# ─────────────────────────────────────────────
-# Recommendation history (service role — bypasses RLS)
-# ─────────────────────────────────────────────
+# ── User profiles ─────────────────────────────────────────────────
 
-def save_recommendation_history(user_id: str, profile: dict, products: list[dict]) -> bool:
-    """Persist a recommendation session to recommendation_history."""
+def save_user_profile(user_id: str, display_name: str, skin_type: str, skin_concerns: list[str]) -> bool:
     try:
         client = _get_service_client()
-        product_snapshot = [{k: v for k, v in p.items() if k != "score"} for p in products]
+        client.table("user_profiles").upsert({
+            "user_id":       user_id,
+            "display_name":  display_name,
+            "skin_type":     skin_type,
+            "skin_concerns": json.dumps(skin_concerns),
+            "updated_at":    "now()",
+        }).execute()
+        return True
+    except Exception as exc:
+        st.error(f"Error saving profile: {exc}")
+        return False
+
+
+def fetch_user_profile(user_id: str) -> dict:
+    try:
+        client = _get_service_client()
+        res = client.table("user_profiles").select("*").eq("user_id", user_id).execute()
+        rows = res.data or []
+        if rows:
+            p = rows[0]
+            concerns_raw = p.get("skin_concerns", "[]")
+            try:
+                concerns = json.loads(concerns_raw) if isinstance(concerns_raw, str) else concerns_raw
+            except Exception:
+                concerns = []
+            return {
+                "display_name":  p.get("display_name", ""),
+                "skin_type":     p.get("skin_type", ""),
+                "skin_concerns": concerns,
+            }
+    except Exception as exc:
+        st.error(f"Error fetching profile: {exc}")
+    return {"display_name": "", "skin_type": "", "skin_concerns": []}
+
+
+# ── Recommendation history ────────────────────────────────────────
+
+def save_recommendation_history(user_id: str, profile: dict, products: list[dict]) -> bool:
+    try:
+        client = _get_service_client()
+        snapshot_keys = {
+            "product_id", "product_name", "brand_name", "price_usd",
+            "rating", "loves_count", "reviews",
+            "primary_category", "secondary_category", "tertiary_category",
+            "highlights", "size",
+        }
+        product_snapshot = [{k: v for k, v in p.items() if k in snapshot_keys} for p in products]
         client.table("recommendation_history").insert({
             "user_id":  user_id,
             "profile":  json.dumps(profile),
@@ -96,7 +129,6 @@ def save_recommendation_history(user_id: str, profile: dict, products: list[dict
 
 
 def fetch_recommendation_history(user_id: str) -> list[dict]:
-    """Retrieve all past recommendation sessions for a user, newest first."""
     try:
         client = _get_service_client()
         response = (
@@ -118,22 +150,37 @@ def fetch_recommendation_history(user_id: str) -> list[dict]:
         return []
 
 
-# ─────────────────────────────────────────────
-# Collaborative filtering data
-# ─────────────────────────────────────────────
+# ── Collaborative filtering ───────────────────────────────────────
 
 def fetch_collab_scores() -> list[dict]:
-    """
-    Fetch aggregated user feedback scores from the product_collab_scores view.
-
-    Returns rows: { product_id, avg_user_rating, feedback_count }
-    Used by the collaborative filtering stage of the recommendation engine.
-    """
     try:
         client = _get_service_client()
         response = client.table("product_collab_scores").select("*").execute()
         return response.data or []
     except Exception as exc:
-        # Non-fatal: engine falls back to neutral CF scores
         print(f"[database] Could not fetch collab scores: {exc}")
+        return []
+
+
+# ── Admin helpers ─────────────────────────────────────────────────
+
+def fetch_all_feedback() -> list[dict]:
+    """For the admin panel — all feedback rows with product name joined."""
+    try:
+        client = _get_service_client()
+        res = client.table("feedback").select("*, products(product_name, brand_name)").execute()
+        return res.data or []
+    except Exception as exc:
+        st.error(f"Error fetching feedback: {exc}")
+        return []
+
+
+def fetch_product_stats() -> list[dict]:
+    """Return products with their collab scores for the admin panel."""
+    try:
+        client = _get_service_client()
+        res = client.table("product_collab_scores").select("*").execute()
+        return res.data or []
+    except Exception as exc:
+        st.error(f"Error fetching product stats: {exc}")
         return []

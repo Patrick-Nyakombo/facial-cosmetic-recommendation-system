@@ -1,25 +1,34 @@
 """
 app.py - Streamlit UI for Facial Cosmetics Recommendation System
-MSc Thesis Prototype — Entry point (mobile-responsive, hybrid recommender)
+MSc Thesis Prototype
+
+Pages:
+  - Login / Register (with skin profile capture at signup — FR-1)
+  - Recommendations  (skin type + concern pre-filled from profile — FR-3)
+  - Product Detail   (dedicated full product view — FR-3 / Figure 4.8)
+  - My History       (past recommendation sessions)
+  - My Profile       (edit skin type & concerns — FR-1)
+  - Admin Panel      (product stats + feedback table — FR-2 / Figure 4.9)
 """
 
+import json
+import ast
 import streamlit as st
-from auth import sign_in, sign_up, sign_out, get_current_user
+from auth import sign_in, sign_up, sign_out, get_current_user, is_admin
 from database import (
-    fetch_products,
-    fetch_collab_scores,
-    insert_feedback,
-    save_recommendation_history,
-    fetch_recommendation_history,
+    fetch_products, fetch_collab_scores, insert_feedback,
+    save_recommendation_history, fetch_recommendation_history,
+    save_user_profile, fetch_user_profile,
+    fetch_all_feedback, fetch_product_stats,
 )
 from recommendation_engine import run_recommendation_pipeline
 from openai_service import generate_explanation
 
 st.set_page_config(page_title="Cosmetics Recommender", page_icon="💄", layout="centered")
 
-# ─────────────────────────────────────────────
-# Global CSS
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# GLOBAL CSS
+# ═══════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
@@ -27,11 +36,15 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 .block-container {
     padding-top: 1.5rem !important; padding-bottom: 2rem !important;
     padding-left: 1rem !important;  padding-right: 1rem !important;
-    max-width: 860px !important;
+    max-width: 880px !important;
 }
 .product-card {
     background: #FAFAFA; border: 1px solid #EBEBEB;
     border-radius: 14px; padding: 1.2rem 1.4rem; margin-bottom: 0.6rem;
+}
+.detail-card {
+    background: #fff; border: 1.5px solid #E0E0F0;
+    border-radius: 16px; padding: 1.6rem 1.8rem; margin-bottom: 1rem;
 }
 .rank-badge {
     display: inline-block; background: #1A1A2E; color: #fff;
@@ -42,6 +55,16 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     display: inline-block; background: #F3E8FF; color: #6B21A8;
     font-size: 0.72rem; font-weight: 600; padding: 3px 10px;
     border-radius: 20px; margin-left: 6px;
+}
+.tag-badge {
+    display: inline-block; background: #FEF9C3; color: #854D0E;
+    font-size: 0.70rem; font-weight: 600; padding: 2px 8px;
+    border-radius: 20px; margin: 2px 3px 2px 0;
+}
+.skin-badge {
+    display: inline-block; background: #ECFDF5; color: #065F46;
+    font-size: 0.70rem; font-weight: 600; padding: 2px 8px;
+    border-radius: 20px; margin: 2px 3px 2px 0;
 }
 .product-title { font-size: 1.1rem; font-weight: 700; color: #1A1A2E; margin: 4px 0 2px 0; }
 .meta-row { font-size: 0.84rem; color: #555; margin-bottom: 6px; }
@@ -63,9 +86,11 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     background: #F9FAFB; border: 1px solid #E5E7EB; border-radius: 8px;
     padding: 0.7rem 1rem; font-size: 0.8rem; color: #374151; margin: 0.4rem 0;
 }
-@media (max-width: 640px) {
-    .stButton > button { width: 100% !important; }
+.admin-stat {
+    background: #F8FAFF; border: 1px solid #DBEAFE; border-radius: 10px;
+    padding: 0.9rem 1.1rem; text-align: center;
 }
+@media (max-width: 640px) { .stButton > button { width: 100% !important; } }
 .stButton > button { border-radius: 10px !important; font-weight: 600 !important; }
 [data-testid="stSidebar"] { background: #1A1A2E !important; }
 [data-testid="stSidebar"] * { color: #E8E8F0 !important; }
@@ -77,31 +102,66 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────
-# Session state defaults
-# ─────────────────────────────────────────────
+# ── Session defaults ─────────────────────────────────────────────
 for key, default in {
     "user": None, "page": "login",
     "recommendations": None, "last_profile": None,
-    "feedback_submitted": {},
+    "feedback_submitted": {}, "feedback_reviews": {},
+    "_products_cache": None,
+    "detail_product": None,
+    "user_profile": {"display_name": "", "skin_type": "", "skin_concerns": []},
+    "is_admin": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
-CATEGORIES = ["all", "moisturizer", "serum", "cleanser", "lip", "eye cream",
-               "sunscreen", "toner", "mask", "foundation", "blush"]
 
-CAT_EMOJI = {
-    "all": "🛍️", "moisturizer": "💧", "serum": "✨", "cleanser": "🫧",
-    "lip": "💋", "eye cream": "👁️", "sunscreen": "☀️",
-    "toner": "🌿", "mask": "🧖", "foundation": "🎨", "blush": "🌸",
-}
+SKIN_TYPES   = ["", "oily", "dry", "combination", "sensitive"]
+SKIN_CONCERNS = ["acne", "aging", "hyperpigmentation", "dryness"]
+ADMIN_EMAIL  = "admin@cosmeticsrecommender.com"   # override via admin_users table
 
-def set_page(p): st.session_state["page"] = p
+
+def set_page(p):
+    st.session_state["page"] = p
+
+
+def _parse_highlights(raw) -> list[str]:
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(t).strip() for t in raw]
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(t).strip() for t in parsed]
+    except Exception:
+        pass
+    try:
+        parsed = ast.literal_eval(raw)
+        if isinstance(parsed, list):
+            return [str(t).strip() for t in parsed]
+    except Exception:
+        pass
+    return []
+
+
+def _get_filter_options(products: list[dict]) -> dict:
+    primary_cats   = sorted({p.get("primary_category") or "" for p in products if p.get("primary_category")})
+    secondary_cats = sorted({p.get("secondary_category") or "" for p in products if p.get("secondary_category")})
+    all_tags: set[str] = set()
+    for p in products:
+        for t in _parse_highlights(p.get("highlights")):
+            if t:
+                all_tags.add(t)
+    return {
+        "primary_cats":   ["all"] + primary_cats,
+        "secondary_cats": ["all"] + secondary_cats,
+        "all_tags":       sorted(all_tags),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
-# AUTH PAGE
+# AUTH PAGE  — Login + Registration with skin profile
 # ═══════════════════════════════════════════════════════════════
 
 def render_auth_page():
@@ -128,27 +188,47 @@ def render_auth_page():
             else:
                 ok, err = sign_in(email, pwd)
                 if ok:
-                    set_page("recommendations"); st.rerun()
+                    set_page("recommendations")
+                    st.rerun()
                 else:
                     st.error(f"Login failed: {err}")
 
     with tab_signup:
         st.write("")
-        email   = st.text_input("Email address",       key="signup_email",    placeholder="you@example.com")
-        pwd     = st.text_input("Password (min 6)",    key="signup_password", type="password", placeholder="••••••••")
-        confirm = st.text_input("Confirm password",    key="signup_confirm",  type="password", placeholder="••••••••")
+        st.markdown("**Account details**")
+        s_name  = st.text_input("Display name",       key="signup_name",     placeholder="Jane")
+        s_email = st.text_input("Email address",      key="signup_email",    placeholder="you@example.com")
+        s_pwd   = st.text_input("Password (min 6)",   key="signup_password", type="password", placeholder="••••••••")
+        s_conf  = st.text_input("Confirm password",   key="signup_confirm",  type="password", placeholder="••••••••")
+
+        st.write("")
+        st.markdown("**Skin profile** *(helps personalise recommendations)*")
+        s_skin_type = st.selectbox(
+            "Skin type", SKIN_TYPES, key="signup_skin_type",
+            format_func=lambda x: "Select skin type…" if x == "" else x.title(),
+        )
+        s_concerns = st.multiselect(
+            "Skin concerns", SKIN_CONCERNS, key="signup_concerns",
+            format_func=str.title,
+        )
+
         st.write("")
         if st.button("Create Account", use_container_width=True, type="primary"):
-            if not email or not pwd:
-                st.warning("Please fill in all fields.")
-            elif pwd != confirm:
+            if not s_email or not s_pwd:
+                st.warning("Please fill in all required fields.")
+            elif s_pwd != s_conf:
                 st.error("Passwords do not match.")
-            elif len(pwd) < 6:
+            elif len(s_pwd) < 6:
                 st.error("Password must be at least 6 characters.")
             else:
-                ok, err = sign_up(email, pwd)
+                ok, err = sign_up(
+                    email=s_email, password=s_pwd,
+                    display_name=s_name,
+                    skin_type=s_skin_type,
+                    skin_concerns=s_concerns,
+                )
                 if ok:
-                    st.success("✅ Account created! You can now log in.")
+                    st.success("✅ Account created! Please log in.")
                 else:
                     st.error(f"Sign-up failed: {err}")
 
@@ -158,40 +238,311 @@ def render_auth_page():
 # ═══════════════════════════════════════════════════════════════
 
 def render_sidebar():
-    user = get_current_user()
+    user    = get_current_user()
+    profile = st.session_state.get("user_profile", {})
+    name    = profile.get("display_name") or user["email"].split("@")[0]
+
     with st.sidebar:
-        st.markdown("<div style='font-size:0.75rem;opacity:0.6;'>Signed in as</div>", unsafe_allow_html=True)
-        st.markdown(f"**{user['email']}**")
+        st.markdown(f"<div style='font-size:0.75rem;opacity:0.6;'>Signed in as</div>", unsafe_allow_html=True)
+        st.markdown(f"**{name}**")
+        skin = profile.get("skin_type", "")
+        if skin:
+            st.markdown(f"<span class='skin-badge'>🧴 {skin.title()} skin</span>", unsafe_allow_html=True)
         st.divider()
-        if st.button("💄  Recommendations", use_container_width=True): set_page("recommendations"); st.rerun()
-        if st.button("📋  My History",       use_container_width=True): set_page("history");         st.rerun()
+
+        if st.button("💄  Recommendations", use_container_width=True):
+            set_page("recommendations"); st.rerun()
+        if st.button("📋  My History",      use_container_width=True):
+            set_page("history"); st.rerun()
+        if st.button("👤  My Profile",      use_container_width=True):
+            set_page("profile"); st.rerun()
+
+        if is_admin():
+            st.divider()
+            if st.button("🛠️  Admin Panel", use_container_width=True):
+                set_page("admin"); st.rerun()
+
         st.divider()
-        if st.button("🚪  Log Out",           use_container_width=True):
+        if st.button("🚪  Log Out", use_container_width=True):
             sign_out(); set_page("login"); st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════
-# RECOMMENDATIONS PAGE
+# PROFILE PAGE  — edit skin type & concerns (FR-1)
+# ═══════════════════════════════════════════════════════════════
+
+def render_profile_page():
+    user    = get_current_user()
+    profile = st.session_state.get("user_profile", {})
+
+    st.markdown("<h2 style='font-size:1.45rem;font-weight:800;color:#1A1A2E;'>👤 My Profile</h2>",
+                unsafe_allow_html=True)
+    st.caption("Your skin profile is used to personalise recommendations.")
+    st.write("")
+
+    with st.form("profile_form"):
+        display_name = st.text_input("Display name", value=profile.get("display_name", ""))
+
+        st.markdown("**Skin Profile**")
+        current_skin = profile.get("skin_type", "")
+        skin_idx     = SKIN_TYPES.index(current_skin) if current_skin in SKIN_TYPES else 0
+        skin_type    = st.selectbox(
+            "Skin type", SKIN_TYPES, index=skin_idx,
+            format_func=lambda x: "Not specified" if x == "" else x.title(),
+        )
+        current_concerns = profile.get("skin_concerns", [])
+        skin_concerns    = st.multiselect(
+            "Skin concerns", SKIN_CONCERNS,
+            default=[c for c in current_concerns if c in SKIN_CONCERNS],
+            format_func=str.title,
+        )
+
+        st.write("")
+        submitted = st.form_submit_button("💾 Save Profile", use_container_width=True, type="primary")
+
+    if submitted:
+        ok = save_user_profile(user["id"], display_name, skin_type, skin_concerns)
+        if ok:
+            st.session_state["user_profile"] = {
+                "display_name":  display_name,
+                "skin_type":     skin_type,
+                "skin_concerns": skin_concerns,
+            }
+            st.success("✅ Profile saved!")
+        else:
+            st.error("Failed to save profile. Please try again.")
+
+
+# ═══════════════════════════════════════════════════════════════
+# PRODUCT DETAIL PAGE  (FR-3, Figure 4.8)
+# ═══════════════════════════════════════════════════════════════
+
+def render_product_detail_page():
+    product = st.session_state.get("detail_product")
+    if not product:
+        st.warning("No product selected.")
+        if st.button("← Back to Recommendations"):
+            set_page("recommendations"); st.rerun()
+        return
+
+    if st.button("← Back to Recommendations"):
+        set_page("recommendations"); st.rerun()
+
+    st.write("")
+
+    pid       = product.get("product_id", "")
+    p_name    = product.get("product_name", "Unknown Product")
+    brand     = product.get("brand_name", "")
+    price     = float(product.get("price_usd") or 0)
+    rating    = float(product.get("rating") or 0)
+    loves     = int(product.get("loves_count") or 0)
+    reviews   = int(product.get("reviews") or 0)
+    size      = product.get("size") or ""
+    p_cat     = product.get("primary_category") or ""
+    s_cat     = product.get("secondary_category") or ""
+    t_cat     = product.get("tertiary_category") or ""
+    prod_tags = _parse_highlights(product.get("highlights"))
+    ingredients = product.get("ingredients") or "Not available"
+    score     = round(product.get("score", 0) * 100, 1)
+    cf_score  = round(product.get("cf_score", 0) * 100, 1)
+    fb_count  = product.get("feedback_count", 0)
+    rec_rate  = round((product.get("recommend_rate") or 0) * 100)
+
+    # Category breadcrumb
+    cat_crumb = " › ".join(c for c in [p_cat, s_cat, t_cat] if c)
+
+    tags_html = "".join(f'<span class="tag-badge">{t}</span>' for t in prod_tags)
+
+    badges = ""
+    if int(product.get("sephora_exclusive") or 0):
+        badges += ' <span style="background:#FFE4E6;color:#9F1239;font-size:0.72rem;font-weight:700;padding:3px 9px;border-radius:20px;">Sephora Exclusive</span>'
+    if int(product.get("new") or 0):
+        badges += ' <span style="background:#DCFCE7;color:#14532D;font-size:0.72rem;font-weight:700;padding:3px 9px;border-radius:20px;">New</span>'
+    if int(product.get("limited_edition") or 0):
+        badges += ' <span style="background:#FEF3C7;color:#92400E;font-size:0.72rem;font-weight:700;padding:3px 9px;border-radius:20px;">Limited Edition</span>'
+    if int(product.get("online_only") or 0):
+        badges += ' <span style="background:#EFF6FF;color:#1E40AF;font-size:0.72rem;font-weight:700;padding:3px 9px;border-radius:20px;">Online Only</span>'
+
+    size_cell   = (f'<div><div style="font-size:0.75rem;color:#888;">Size</div>'
+                   f'<div style="font-size:1rem;font-weight:600;color:#1A1A2E;">{size}</div></div>') if size else ""
+    cf_label    = f"({fb_count} ratings)" if fb_count else "(new)"
+    rec_pill    = (f'<span style="display:inline-block;background:#FDF4FF;color:#7E22CE;'
+                   f'font-size:0.78rem;font-weight:600;padding:3px 10px;border-radius:20px;margin-left:6px;">'
+                   f'👍 {rec_rate}% recommend</span>') if fb_count else ""
+
+    detail_html = (
+        '<div class="detail-card">'
+        f'<div style="margin-bottom:8px;"><span class="cat-badge">{cat_crumb}</span>{badges}</div>'
+        f'<div style="font-size:1.5rem;font-weight:800;color:#1A1A2E;margin:8px 0 4px 0;">{p_name}</div>'
+        f'<div style="font-size:1rem;color:#555;margin-bottom:12px;">{brand}</div>'
+        '<div style="display:flex;gap:2rem;flex-wrap:wrap;margin-bottom:14px;">'
+        f'<div><div style="font-size:0.75rem;color:#888;">Price</div><div style="font-size:1.2rem;font-weight:700;color:#1A1A2E;">${price:.2f}</div></div>'
+        f'<div><div style="font-size:0.75rem;color:#888;">Rating</div><div style="font-size:1.2rem;font-weight:700;color:#1A1A2E;">⭐ {rating:.2f}/5</div></div>'
+        f'<div><div style="font-size:0.75rem;color:#888;">Loves</div><div style="font-size:1.2rem;font-weight:700;color:#1A1A2E;">❤️ {loves:,}</div></div>'
+        f'<div><div style="font-size:0.75rem;color:#888;">Reviews</div><div style="font-size:1.2rem;font-weight:700;color:#1A1A2E;">💬 {reviews:,}</div></div>'
+        f"{size_cell}"
+        "</div>"
+        f'<div style="margin-bottom:10px;">{tags_html}</div>'
+        '<div style="margin-top:10px;">'
+        f'<span class="score-pill">Match {score}%</span>'
+        f'<span class="cf-pill">👥 CF {cf_score}% {cf_label}</span>'
+        f"{rec_pill}"
+        "</div>"
+        "</div>"
+    )
+    st.markdown(detail_html, unsafe_allow_html=True)
+
+    # Variation info
+    v_type = product.get("variation_type") or ""
+    v_val  = product.get("variation_value") or ""
+    if v_type or v_val:
+        st.markdown(f"**Variation:** {v_type} — {v_val}" if v_type and v_val else f"**Variation:** {v_type or v_val}")
+
+    # Score breakdown
+    with st.expander("📊 Score breakdown", expanded=True):
+        skin_m  = round(product.get("_skin_type_match", 0) * 100, 1)
+        conc_m  = round(product.get("_concern_match", 0) * 100, 1)
+        tag_m   = round(product.get("_tag_match", 0) * 100, 1)
+        price_f = round(product.get("_price_score", 0) * 100, 1)
+        rat_n   = round(product.get("_norm_rating", 0) * 100, 1)
+        cb_s    = round(product.get("cb_score", 0) * 100, 1)
+        st.markdown(f"""
+        <div class="score-breakdown">
+            <strong>Hybrid score {score}%</strong> = 65% content-based + 35% collaborative<br><br>
+            <strong>Content-based ({cb_s}%)</strong><br>
+            &nbsp;&nbsp;• Skin type match: {skin_m}%<br>
+            &nbsp;&nbsp;• Concern match: {conc_m}%<br>
+            &nbsp;&nbsp;• Rating signal: {rat_n}%<br>
+            &nbsp;&nbsp;• Tag match: {tag_m}%<br>
+            &nbsp;&nbsp;• Price fit: {price_f}%<br><br>
+            <strong>Collaborative ({cf_score}%)</strong> —
+            {f'{fb_count} user rating(s) · {rec_rate}% recommend' if fb_count else 'No ratings yet — neutral score applied'}
+        </div>""", unsafe_allow_html=True)
+
+    # Ingredients
+    with st.expander("🧪 Full Ingredients List"):
+        st.write(ingredients)
+
+    # AI explanation
+    exp_key = f"explanation_{pid}"
+    profile = st.session_state.get("user_profile", {})
+    skin_str    = profile.get("skin_type", "") or "general"
+    concern_str = ", ".join(profile.get("skin_concerns", [])) or "general"
+    if exp_key not in st.session_state:
+        with st.spinner("Generating AI explanation…"):
+            st.session_state[exp_key] = generate_explanation(
+                skin_type=skin_str, concern=concern_str,
+                ingredients=ingredients, rating=rating,
+                product_name=p_name,
+            )
+    explanation = st.session_state.get(exp_key)
+    if explanation:
+        st.markdown(f'<div class="ai-box">🤖 <strong>Why this product?</strong><br><br>{explanation}</div>',
+                    unsafe_allow_html=True)
+
+    # Rich feedback form (FR-4)
+    st.write("")
+    st.markdown("### 💬 Leave a Review")
+    already = st.session_state["feedback_submitted"].get(pid, False)
+    if already:
+        st.success("✅ Your review has been submitted — thank you!")
+    else:
+        with st.form(f"feedback_form_{pid}"):
+            f_rating      = st.slider("Overall rating", 1, 5, 4)
+            f_recommended = st.radio("Would you recommend this product?",
+                                     ["Yes", "No"], horizontal=True)
+            f_review      = st.text_area("Write a review (optional)",
+                                         placeholder="Share what you liked or didn't like…",
+                                         max_chars=500)
+            submitted = st.form_submit_button("Submit Review", use_container_width=True, type="primary")
+
+        if submitted:
+            ok = insert_feedback(
+                product_id     = pid,
+                rating         = f_rating,
+                is_recommended = (f_recommended == "Yes"),
+                review_text    = f_review,
+            )
+            if ok:
+                st.session_state["feedback_submitted"][pid] = True
+                st.rerun()
+            else:
+                st.error("Failed to save review.")
+
+
+# ═══════════════════════════════════════════════════════════════
+# RECOMMENDATIONS PAGE  (FR-3)
 # ═══════════════════════════════════════════════════════════════
 
 def render_recommendations_page():
     st.markdown("<h2 style='font-size:1.45rem;font-weight:800;color:#1A1A2E;'>💄 Get Recommendations</h2>",
                 unsafe_allow_html=True)
 
+    if st.session_state["_products_cache"] is None:
+        with st.spinner("Loading catalogue…"):
+            st.session_state["_products_cache"] = fetch_products()
+
+    all_products = st.session_state["_products_cache"]
+    opts = _get_filter_options(all_products) if all_products else {
+        "primary_cats": ["all"], "secondary_cats": ["all"], "all_tags": []
+    }
+
+    # Pre-fill from stored skin profile
+    stored_profile  = st.session_state.get("user_profile", {})
+    default_skin    = stored_profile.get("skin_type", "")
+    default_concerns = stored_profile.get("skin_concerns", [])
+
     with st.sidebar:
         st.markdown("### 🧴 Skin Profile")
-        skin_type = st.selectbox("Skin Type",    ["oily", "dry", "combination", "sensitive"])
-        concern   = st.selectbox("Skin Concern", ["acne", "aging", "hyperpigmentation", "dryness"])
+        skin_type = st.selectbox(
+            "Skin type",
+            SKIN_TYPES,
+            index=SKIN_TYPES.index(default_skin) if default_skin in SKIN_TYPES else 0,
+            format_func=lambda x: "Not specified" if x == "" else x.title(),
+            help="Pre-filled from your profile. Change it anytime.",
+        )
+        skin_concerns = st.multiselect(
+            "Skin concerns",
+            SKIN_CONCERNS,
+            default=[c for c in default_concerns if c in SKIN_CONCERNS],
+            format_func=str.title,
+        )
 
-        st.markdown("### 🛍️ Category")
-        cat_labels = [f"{CAT_EMOJI.get(c,'🔹')} {c.title()}" for c in CATEGORIES]
-        cat_idx    = st.selectbox("Product category", range(len(CATEGORIES)),
-                                  format_func=lambda i: cat_labels[i])
-        selected_category = CATEGORIES[cat_idx]
+        st.markdown("### 🗂️ Category")
+        primary_cat = st.selectbox(
+            "Primary category", opts["primary_cats"],
+            format_func=lambda c: "🛍️ All Categories" if c == "all" else c,
+        )
+        if primary_cat != "all":
+            sec_opts = ["all"] + sorted({
+                p.get("secondary_category") or ""
+                for p in all_products
+                if (p.get("primary_category") or "").lower() == primary_cat.lower()
+                and p.get("secondary_category")
+            })
+        else:
+            sec_opts = opts["secondary_cats"]
+        secondary_cat = st.selectbox(
+            "Sub-category (optional)", sec_opts,
+            format_func=lambda c: "All" if c == "all" else c,
+        )
+
+        st.markdown("### 🏷️ Extra Tags")
+        relevant_tags = sorted({
+            tag
+            for p in all_products
+            if primary_cat == "all" or (p.get("primary_category") or "").lower() == primary_cat.lower()
+            for tag in _parse_highlights(p.get("highlights"))
+        }) if all_products else opts["all_tags"]
+        selected_tags = st.multiselect("Optional highlights to match", relevant_tags,
+                                       placeholder="e.g. Vegan, Layerable…")
 
         st.markdown("### ⚙️ Filters")
-        ingredients_to_avoid = st.text_input("Avoid ingredients", placeholder="e.g. alcohol, fragrance")
-        max_budget = st.number_input("Max Budget ($)", min_value=1.0, max_value=500.0, value=50.0, step=1.0)
+        ingredients_to_avoid = st.text_input("Avoid ingredients",
+                                              placeholder="e.g. alcohol, fragrance")
+        max_budget  = st.number_input("Max Budget ($)", min_value=1.0, max_value=1000.0,
+                                      value=100.0, step=5.0)
+        include_oos = st.checkbox("Include out-of-stock products", value=False)
 
         st.write("")
         run_button = st.button("🔍 Get Recommendations", use_container_width=True, type="primary")
@@ -199,30 +550,33 @@ def render_recommendations_page():
     if run_button:
         avoided = [i.strip() for i in ingredients_to_avoid.split(",") if i.strip()]
         profile = {
-            "skin_type": skin_type, "concern": concern,
-            "category": selected_category,
-            "ingredients_to_avoid": avoided, "max_budget": max_budget,
+            "skin_type":            skin_type,
+            "skin_concerns":        skin_concerns,
+            "primary_category":     primary_cat,
+            "secondary_category":   secondary_cat,
+            "tags_to_match":        selected_tags,
+            "ingredients_to_avoid": avoided,
+            "max_budget":           max_budget,
+            "include_out_of_stock": include_oos,
         }
 
-        with st.spinner("Fetching products…"):
-            products     = fetch_products()
-            collab_data  = fetch_collab_scores()
+        with st.spinner("Running hybrid recommendation engine…"):
+            products    = fetch_products()
+            collab_data = fetch_collab_scores()
 
         if not products:
             st.error("⚠️ Could not load products. Check your Supabase credentials.")
             return
 
-        with st.spinner("Running hybrid recommendation engine…"):
-            top5 = run_recommendation_pipeline(products, profile, collab_data=collab_data)
+        top5 = run_recommendation_pipeline(products, profile, collab_data=collab_data)
 
         if not top5:
-            st.warning("😕 No products matched your criteria. Try a higher budget, different category, or fewer restrictions.")
+            st.warning("😕 No products matched your criteria. Try a higher budget, broader category, or fewer restrictions.")
             return
 
         st.session_state["recommendations"]   = top5
         st.session_state["last_profile"]       = profile
         st.session_state["feedback_submitted"] = {}
-        # Clear cached explanations for new search
         for key in list(st.session_state.keys()):
             if key.startswith("explanation_"):
                 del st.session_state[key]
@@ -231,7 +585,6 @@ def render_recommendations_page():
         if user:
             save_recommendation_history(user["id"], profile, top5)
 
-    # ── Render from session state ───────────────────────────────
     top5    = st.session_state.get("recommendations")
     profile = st.session_state.get("last_profile")
 
@@ -241,94 +594,112 @@ def render_recommendations_page():
                     margin-top:1rem;border:1px solid #E0E0F0;'>
             <div style='font-weight:700;font-size:0.95rem;color:#1A1A2E;margin-bottom:0.6rem;'>
                 How the hybrid engine works</div>
-            <ol style='margin:0;padding-left:1.2rem;font-size:0.86rem;color:#444;line-height:1.9;'>
-                <li><strong>Rule-Based Filter</strong> — enforces skin type, concern, category, budget &amp; avoided ingredients.</li>
-                <li><strong>Content-Based Score</strong> — weights: skin type 35% · concern 25% · rating 20% · price 10% · category 10%.</li>
-                <li><strong>Collaborative Filtering</strong> — blends in aggregated user feedback ratings (35% weight).</li>
-                <li><strong>AI Explanation</strong> — GPT writes a personalised 3-sentence rationale per product.</li>
+            <ol style='margin:0;padding-left:1.2rem;font-size:0.86rem;color:#444;line-height:2;'>
+                <li><strong>Rule-Based Filter</strong> — category, budget, avoided ingredients, stock status.</li>
+                <li><strong>Content-Based Score</strong> — skin type 20% · concern 20% · rating 20% · popularity 10% · price fit 10% · tags 10% · category 5% · reviews 5%.</li>
+                <li><strong>Collaborative Filtering</strong> — helpfulness-weighted user reviews (35% blend).</li>
+                <li><strong>AI Explanation</strong> — GPT writes a personalised rationale per product.</li>
             </ol>
         </div>""", unsafe_allow_html=True)
         return
 
-    skin_type = profile["skin_type"]
-    concern   = profile["concern"]
-    cat_label = profile.get("category", "all")
+    skin_type     = profile.get("skin_type", "")
+    skin_concerns = profile.get("skin_concerns", [])
+    primary_cat   = profile.get("primary_category", "all")
+    secondary_cat = profile.get("secondary_category", "all")
+    tags          = profile.get("tags_to_match", [])
+    cat_label     = primary_cat if primary_cat != "all" else "All Categories"
+    if secondary_cat != "all":
+        cat_label += f" › {secondary_cat}"
 
-    st.success(f"✅ Top {len(top5)} **{cat_label}** products · {skin_type} skin · {concern}")
+    summary_parts = [f"✅ Top {len(top5)} results · {cat_label}"]
+    if skin_type:
+        summary_parts.append(f"{skin_type.title()} skin")
+    if skin_concerns:
+        summary_parts.append(", ".join(c.title() for c in skin_concerns))
+    st.success(" · ".join(summary_parts))
     st.write("")
 
     for rank, product in enumerate(top5, start=1):
-        pid      = product["id"]
+        pid      = product["product_id"]
         score    = round(product.get("score", 0) * 100, 1)
-        cb_score = round(product.get("cb_score", 0) * 100, 1)
         cf_score = round(product.get("cf_score", 0) * 100, 1)
         fb_count = product.get("feedback_count", 0)
-        cat      = product.get("category", "")
+        rec_rate = round((product.get("recommend_rate") or 0) * 100)
+        p_cat    = product.get("primary_category") or ""
+        p_subcat = product.get("secondary_category") or ""
+        prod_tags = _parse_highlights(product.get("highlights"))
+        tags_html = "".join(f'<span class="tag-badge">{t}</span>' for t in prod_tags[:4])
+        cat_display = p_cat + (f" › {p_subcat}" if p_subcat else "")
+        price   = float(product.get("price_usd") or 0)
+        rating  = product.get("rating") or "N/A"
+        loves   = int(product.get("loves_count") or 0)
+        size    = product.get("size") or ""
 
-        st.markdown(f"""
-        <div class="product-card">
-            <div>
-                <span class="rank-badge">#{rank}</span>
-                <span class="cat-badge">{CAT_EMOJI.get(cat,'🔹')} {cat.title()}</span>
-            </div>
-            <div class="product-title">{product['name']}</div>
-            <div class="meta-row">
-                {product['brand']} &nbsp;·&nbsp;
-                ${float(product['price']):.2f} &nbsp;·&nbsp;
-                ⭐ {product['rating']}/5
-            </div>
-            <div>
-                <span class="score-pill">Match {score}%</span>
-                <span class="cf-pill">
-                    👥 CF {cf_score}%{f' ({fb_count} ratings)' if fb_count > 0 else ' (new)'}
-                </span>
-            </div>
-        </div>""", unsafe_allow_html=True)
+        badges = ""
+        if int(product.get("sephora_exclusive") or 0):
+            badges += ' <span style="background:#FFE4E6;color:#9F1239;font-size:0.68rem;font-weight:700;padding:2px 7px;border-radius:20px;">Sephora Exclusive</span>'
+        if int(product.get("new") or 0):
+            badges += ' <span style="background:#DCFCE7;color:#14532D;font-size:0.68rem;font-weight:700;padding:2px 7px;border-radius:20px;">New</span>'
 
-        with st.expander("📊 Score breakdown"):
-            st.markdown(f"""
-            <div class="score-breakdown">
-                <strong>Hybrid score</strong> = 65% content-based + 35% collaborative<br>
-                &nbsp;&nbsp;• Content-based score: <strong>{cb_score}%</strong>
-                &nbsp;&nbsp;• Collaborative score: <strong>{cf_score}%</strong>
-                {f'<br>&nbsp;&nbsp;• Based on <strong>{fb_count}</strong> user rating(s)' if fb_count > 0
-                  else '<br>&nbsp;&nbsp;• No ratings yet — neutral CF score applied'}
-            </div>""", unsafe_allow_html=True)
+        size_str   = f" &nbsp;·&nbsp; {size}" if size else ""
+        cf_str     = f" &nbsp;·&nbsp; {rec_rate}% recommend" if fb_count else " (new)"
+        p_name_str = product.get("product_name") or "Unknown Product"
+        brand_str  = product.get("brand_name") or ""
 
-        with st.expander("🧪 Ingredients"):
-            st.write(product.get("ingredients", "N/A"))
+        card_html = (
+            '<div class="product-card">'
+            "<div>"
+            f'<span class="rank-badge">#{rank}</span>'
+            f'<span class="cat-badge">{cat_display}</span>'
+            f"{badges}"
+            "</div>"
+            f'<div class="product-title">{p_name_str}</div>'
+            f'<div class="meta-row">{brand_str} &nbsp;·&nbsp; ${price:.2f}{size_str} &nbsp;·&nbsp; ⭐ {rating}/5 &nbsp;·&nbsp; ❤️ {loves:,}</div>'
+            f'<div style="margin-bottom:8px;">{tags_html}</div>'
+            "<div>"
+            f'<span class="score-pill">Match {score}%</span>'
+            f'<span class="cf-pill">👥 CF {cf_score}%{cf_str}</span>'
+            "</div>"
+            "</div>"
+        )
+        st.markdown(card_html, unsafe_allow_html=True)
 
-        # AI explanation (cached)
+        col_detail, col_gap = st.columns([1, 3])
+        with col_detail:
+            if st.button("📄 View Details", key=f"detail_{pid}"):
+                st.session_state["detail_product"] = product
+                set_page("product_detail")
+                st.rerun()
+
+        # Quick AI explanation
         exp_key = f"explanation_{pid}"
         if exp_key not in st.session_state:
+            skin_str    = skin_type or "general"
+            concern_str = ", ".join(skin_concerns) if skin_concerns else "general"
             with st.spinner("Generating AI explanation…"):
                 st.session_state[exp_key] = generate_explanation(
-                    skin_type=skin_type, concern=concern,
+                    skin_type=skin_str, concern=concern_str,
                     ingredients=product.get("ingredients", ""),
-                    rating=product["rating"], product_name=product["name"],
+                    rating=rating, product_name=product.get("product_name", ""),
                 )
         explanation = st.session_state.get(exp_key)
         if explanation:
             st.markdown(f'<div class="ai-box">🤖 <strong>Why this product?</strong><br><br>{explanation}</div>',
                         unsafe_allow_html=True)
-        else:
-            st.warning("AI explanation unavailable.")
 
-        # Feedback
+        # Quick feedback (inline, detail page has full form)
         already = st.session_state["feedback_submitted"].get(pid, False)
         if already:
-            st.success("✅ Feedback submitted — thank you!")
+            st.success("✅ Feedback submitted")
         else:
-            user_rating = st.slider("How useful was this recommendation?",
-                                    1, 5, 3, key=f"slider_{pid}")
-            if st.button("Submit Feedback", key=f"btn_{pid}"):
-                ok = insert_feedback(pid, user_rating)
+            q_rating = st.slider("Quick rating", 1, 5, 4, key=f"slider_{pid}",
+                                 help="Rate this recommendation — full review available on product detail page")
+            if st.button("Submit Rating", key=f"btn_{pid}"):
+                ok = insert_feedback(pid, q_rating)
                 if ok:
                     st.session_state["feedback_submitted"][pid] = True
                     st.rerun()
-                else:
-                    st.error("Failed to save feedback.")
-
         st.write("")
 
 
@@ -358,35 +729,160 @@ def render_history_page():
         profile  = session.get("profile", {})
         products = session.get("products", [])
         ts       = session.get("created_at", "")[:19].replace("T", " ")
-        cat      = profile.get("category", "all")
+        skin     = profile.get("skin_type", "")
+        concerns = profile.get("skin_concerns", [])
+        primary_cat   = profile.get("primary_category", "all")
+        secondary_cat = profile.get("secondary_category", "all")
+        cat_label     = primary_cat if primary_cat != "all" else "All"
+        if secondary_cat != "all":
+            cat_label += f" › {secondary_cat}"
+        budget = profile.get("max_budget", 0)
 
-        label = (
-            f"Session {i} · {ts}  |  "
-            f"{CAT_EMOJI.get(cat,'🛍️')} {cat.title()} · "
-            f"{profile.get('skin_type','?').title()} · "
-            f"{profile.get('concern','?').title()} · "
-            f"${profile.get('max_budget',0):.0f}"
-        )
+        parts = [f"Session {i} · {ts}", cat_label, f"${budget:.0f}"]
+        if skin:
+            parts.append(f"{skin.title()} skin")
+        if concerns:
+            parts.append(", ".join(c.title() for c in concerns[:2]))
 
-        with st.expander(label, expanded=(i == 1)):
+        with st.expander("  |  ".join(parts), expanded=(i == 1)):
             cols = st.columns(4)
-            cols[0].metric("Skin Type", profile.get("skin_type", "—").title())
-            cols[1].metric("Concern",   profile.get("concern",   "—").title())
-            cols[2].metric("Category",  cat.title())
-            cols[3].metric("Budget",    f"${profile.get('max_budget', 0):.0f}")
+            cols[0].metric("Category", cat_label)
+            cols[1].metric("Skin Type", skin.title() if skin else "—")
+            cols[2].metric("Budget",   f"${budget:.0f}")
+            cols[3].metric("Results",  str(len(products)))
 
+            if concerns:
+                st.caption("Concerns: " + ", ".join(c.title() for c in concerns))
             avoided = profile.get("ingredients_to_avoid", [])
             if avoided:
                 st.caption("Avoided: " + ", ".join(avoided))
             st.write("")
+
             for rank, p in enumerate(products, start=1):
-                cat_e = CAT_EMOJI.get(p.get("category", ""), "🔹")
+                p_name   = p.get("product_name", "?")
+                p_brand  = p.get("brand_name", "")
+                p_price  = float(p.get("price_usd") or 0)
+                p_rating = p.get("rating", "?")
+                p_cat    = p.get("primary_category", "")
                 st.markdown(
-                    f"**#{rank}** {cat_e} **{p.get('name','?')}** &nbsp;·&nbsp; "
-                    f"{p.get('brand','')} &nbsp;·&nbsp; "
-                    f"${float(p.get('price',0)):.2f} &nbsp;·&nbsp; "
-                    f"⭐ {p.get('rating','?')}/5"
+                    f"**#{rank}** **{p_name}** &nbsp;·&nbsp; {p_brand} &nbsp;·&nbsp; "
+                    f"${p_price:.2f} &nbsp;·&nbsp; ⭐ {p_rating}/5"
+                    + (f" &nbsp;·&nbsp; {p_cat}" if p_cat else "")
                 )
+
+
+# ═══════════════════════════════════════════════════════════════
+# ADMIN PANEL  (FR-2, Figure 4.9)
+# ═══════════════════════════════════════════════════════════════
+
+def render_admin_page():
+    if not is_admin():
+        st.error("🚫 Access denied. Admin privileges required.")
+        return
+
+    st.markdown("<h2 style='font-size:1.45rem;font-weight:800;color:#1A1A2E;'>🛠️ Administrator Panel</h2>",
+                unsafe_allow_html=True)
+    st.caption("Manage the product catalogue and monitor user feedback.")
+    st.write("")
+
+    tab_stats, tab_products, tab_feedback = st.tabs(
+        ["📊 Overview", "🗄️ Product Database", "💬 Feedback Log"]
+    )
+
+    with tab_stats:
+        products = fetch_products()
+        stats    = fetch_product_stats()
+        feedback = fetch_all_feedback()
+
+        total_products  = len(products)
+        total_feedback  = len(feedback)
+        rated_products  = len(stats)
+        avg_rating      = (sum(float(s.get("avg_user_rating") or 0) for s in stats) / rated_products
+                           if rated_products else 0)
+
+        c1, c2, c3, c4 = st.columns(4)
+        for col, label, value in zip(
+            [c1, c2, c3, c4],
+            ["Total Products", "Total Reviews", "Rated Products", "Avg User Rating"],
+            [total_products, total_feedback, rated_products, f"{avg_rating:.2f}/5"],
+        ):
+            with col:
+                st.markdown(f"""
+                <div class="admin-stat">
+                    <div style="font-size:0.75rem;color:#888;">{label}</div>
+                    <div style="font-size:1.6rem;font-weight:800;color:#1A1A2E;">{value}</div>
+                </div>""", unsafe_allow_html=True)
+
+        if stats:
+            st.write("")
+            st.markdown("**Top rated products (by user reviews)**")
+            sorted_stats = sorted(stats, key=lambda x: float(x.get("avg_user_rating") or 0), reverse=True)
+            for s in sorted_stats[:10]:
+                pid      = s.get("product_id", "")
+                avg_r    = float(s.get("avg_user_rating") or 0)
+                fb_count = int(s.get("feedback_count") or 0)
+                rec_rate = round(float(s.get("recommend_rate") or 0) * 100)
+                # Look up product name
+                match = next((p for p in products if p.get("product_id") == pid), None)
+                name  = match.get("product_name", pid) if match else pid
+                brand = match.get("brand_name", "") if match else ""
+                st.markdown(
+                    f"**{name}** &nbsp;·&nbsp; {brand} &nbsp;·&nbsp; "
+                    f"⭐ {avg_r:.2f}/5 &nbsp;·&nbsp; {fb_count} reviews &nbsp;·&nbsp; "
+                    f"👍 {rec_rate}% recommend"
+                )
+
+    with tab_products:
+        products = fetch_products()
+        st.caption(f"{len(products)} products in database")
+        st.write("")
+
+        search = st.text_input("🔍 Search products", placeholder="Product name or brand…")
+        cat_filter = st.selectbox(
+            "Filter by category",
+            ["All"] + sorted({p.get("primary_category") or "" for p in products if p.get("primary_category")}),
+        )
+
+        filtered = products
+        if search:
+            s = search.lower()
+            filtered = [p for p in filtered if s in (p.get("product_name") or "").lower()
+                        or s in (p.get("brand_name") or "").lower()]
+        if cat_filter != "All":
+            filtered = [p for p in filtered if (p.get("primary_category") or "") == cat_filter]
+
+        st.caption(f"Showing {len(filtered)} product(s)")
+        for p in filtered[:100]:
+            st.markdown(
+                f"**{p.get('product_name','')}** &nbsp;·&nbsp; {p.get('brand_name','')} &nbsp;·&nbsp; "
+                f"${float(p.get('price_usd') or 0):.2f} &nbsp;·&nbsp; "
+                f"⭐ {p.get('rating','?')}/5 &nbsp;·&nbsp; "
+                f"{p.get('primary_category','')} › {p.get('secondary_category','')}"
+            )
+
+    with tab_feedback:
+        feedback = fetch_all_feedback()
+        st.caption(f"{len(feedback)} feedback record(s)")
+        st.write("")
+
+        if not feedback:
+            st.info("No feedback submitted yet.")
+        else:
+            for row in feedback[:200]:
+                pid      = row.get("product_id", "")
+                rating   = row.get("rating", "?")
+                rec      = row.get("is_recommended")
+                review   = row.get("review_text") or ""
+                ts       = (row.get("created_at") or "")[:19].replace("T", " ")
+                prod     = row.get("products") or {}
+                p_name   = prod.get("product_name", pid) if isinstance(prod, dict) else pid
+                rec_str  = "👍 Recommended" if rec else ("👎 Not recommended" if rec is False else "")
+                st.markdown(
+                    f"**{p_name}** &nbsp;·&nbsp; ⭐ {rating}/5 {rec_str} &nbsp;·&nbsp; {ts}"
+                    + (f"<br><small style='color:#555;'>{review}</small>" if review else ""),
+                    unsafe_allow_html=True,
+                )
+                st.divider()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -402,5 +898,11 @@ else:
     render_sidebar()
     if page == "history":
         render_history_page()
+    elif page == "profile":
+        render_profile_page()
+    elif page == "product_detail":
+        render_product_detail_page()
+    elif page == "admin":
+        render_admin_page()
     else:
         render_recommendations_page()
