@@ -116,3 +116,24 @@ def fetch_recommendation_history(user_id: str) -> list[dict]:
     except Exception as exc:
         st.error(f"Database error while fetching history: {exc}")
         return []
+
+
+# ─────────────────────────────────────────────
+# Collaborative filtering data
+# ─────────────────────────────────────────────
+
+def fetch_collab_scores() -> list[dict]:
+    """
+    Fetch aggregated user feedback scores from the product_collab_scores view.
+
+    Returns rows: { product_id, avg_user_rating, feedback_count }
+    Used by the collaborative filtering stage of the recommendation engine.
+    """
+    try:
+        client = _get_service_client()
+        response = client.table("product_collab_scores").select("*").execute()
+        return response.data or []
+    except Exception as exc:
+        # Non-fatal: engine falls back to neutral CF scores
+        print(f"[database] Could not fetch collab scores: {exc}")
+        return []
